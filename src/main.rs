@@ -1,10 +1,11 @@
-mod display;
 mod daemon;
+mod display;
 
-use std::{io::Write, os::unix::net::UnixStream};
 use eyre::{Context, OptionExt, bail};
+use std::{io::Write, os::unix::net::UnixStream};
 
-const MAX_ENTRY_SIZE: u64 = 100_000_000;
+const MAX_ENTRY_SIZE: u64 = 50_000_000;
+const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct Entry {
@@ -37,6 +38,11 @@ fn main() -> eyre::Result<()> {
                     socket_path.display()
                 )
             })?;
+
+            if std::env::args().any(|arg| arg == "--wl-copy") {
+                std::io::copy(&mut std::io::stdin(), &mut std::io::empty())
+                    .wrap_err("reading stdin in --wl-copy mode")?;
+            }
 
             socket
                 .write_all(&[MESSAGE_STORE])

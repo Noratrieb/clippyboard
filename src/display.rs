@@ -5,7 +5,12 @@ use crate::MESSAGE_READ;
 
 use super::MESSAGE_COPY;
 
-use std::{io::{BufReader, Write}, os::unix::net::UnixStream, path::Path, time::Instant};
+use std::{
+    io::{BufReader, Write},
+    os::unix::net::UnixStream,
+    path::Path,
+    time::Instant,
+};
 
 use super::Entry;
 
@@ -44,14 +49,21 @@ impl eframe::App for App {
                 .show_inside(ui, |ui| {
                     ui.heading("History");
 
+                    ui.add_space(10.0);
+
                     for (idx, item) in self.items.iter().enumerate() {
-                        let mut frame = egui::Frame::new();
+                        let mut frame = egui::Frame::new().inner_margin(3.0);
                         if self.selected_idx == idx {
                             frame = frame.stroke(egui::Stroke::new(1.0, egui::Color32::PURPLE));
                         }
                         frame.show(ui, |ui| match item.mime.as_str() {
                             "text/plain" => {
-                                ui.label(str::from_utf8(&item.data).unwrap_or("<invalid UTF-8>"));
+                                let mut full =
+                                    str::from_utf8(&item.data).unwrap_or("<invalid UTF-8>");
+                                if full.len() > 1000 {
+                                    full = &full[..1000];
+                                }
+                                ui.label(full);
                             }
                             "image/png" => {
                                 ui.label("<image>");
@@ -60,6 +72,8 @@ impl eframe::App for App {
                                 ui.label("<unsupported mime type>");
                             }
                         });
+
+                        ui.separator();
                     }
                 });
 
@@ -68,6 +82,8 @@ impl eframe::App for App {
                 let Some(item) = &self.items.get(self.selected_idx) else {
                     return;
                 };
+
+                ui.add_space(10.0);
 
                 match item.mime.as_str() {
                     "text/plain" => {
@@ -101,12 +117,14 @@ pub fn main(socket_path: &Path) -> eyre::Result<()> {
 
     println!("INFO: Reading clipboard history from socket");
     let start = Instant::now();
-    let items =
+    let mut items: Vec<Entry> =
         ciborium::from_reader(BufReader::new(socket)).wrap_err("reading items from socket")?;
     println!(
         "INFO: Read clipboard history from socket in {:?}",
         start.elapsed()
     );
+
+    items.reverse();
 
     // heh. good design.
     let socket = UnixStream::connect(&socket_path).wrap_err_with(|| {
