@@ -8,10 +8,6 @@ pkgs.mkShell rec {
     freetype.dev
     libGL
     pkg-config
-    xorg.libX11
-    xorg.libXcursor
-    xorg.libXi
-    xorg.libXrandr
     wayland
     libxkbcommon
   ];

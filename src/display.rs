@@ -135,7 +135,9 @@ pub fn main(socket_path: &Path) -> eyre::Result<()> {
     })?;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 500.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([500.0, 500.0])
+            .with_app_id("clippyboard"),
         ..Default::default()
     };
     eframe::run_native(
