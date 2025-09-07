@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs> { } }: pkgs.rustPlatform.buildRustPackage {
+{ pkgs ? import <nixpkgs> { } }: pkgs.rustPlatform.buildRustPackage rec {
   name = "clippyboard";
 
   src = pkgs.lib.cleanSource ./.;
@@ -12,6 +12,18 @@
     xorg.libXi
     xorg.libXrandr
   ];
+
+
+  nativeBuildInputs = with pkgs; [
+    pkg-config
+    cmake
+    makeWrapper
+  ];
+
+  postFixup = ''
+    wrapProgram $out/bin/clippyboard \
+      --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
+  '';
 
   cargoLock.lockFile = ./Cargo.lock;
 }
