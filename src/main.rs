@@ -1,8 +1,9 @@
 mod daemon;
 mod display;
 
-use eyre::{Context, OptionExt, bail};
-use std::{io::Write, os::unix::net::UnixStream};
+use eyre::{OptionExt, bail};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::Arc;
 
 const MAX_ENTRY_SIZE: u64 = 50_000_000;
 const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
@@ -11,11 +12,23 @@ const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 struct HistoryItem {
     id: u64,
     mime: String,
-    data: Vec<u8>,
+    #[serde(
+        deserialize_with = "deserialize_data",
+        serialize_with = "serialize_data"
+    )]
+    data: Arc<[u8]>,
     created_time: u64,
 }
 
-const MESSAGE_STORE: u8 = 0;
+fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<[u8]>, D::Error> {
+    Box::<[u8]>::deserialize(deserializer).map(Into::into)
+}
+
+fn serialize_data<S: Serializer>(data: &Arc<[u8]>, serializer: S) -> Result<S::Ok, S::Error> {
+    let data: &[u8] = data;
+    data.serialize(serializer)
+}
+
 const MESSAGE_READ: u8 = 1;
 /// Argument: One u64-bit LE value, the ID
 const MESSAGE_COPY: u8 = 2;
@@ -31,25 +44,8 @@ fn main() -> eyre::Result<()> {
 
     match mode.as_str() {
         "daemon" => daemon::main(&socket_path)?,
-        "store" => {
-            let mut socket = UnixStream::connect(&socket_path).wrap_err_with(|| {
-                format!(
-                    "connecting to socket at {}. is the daemon running?",
-                    socket_path.display()
-                )
-            })?;
-
-            if std::env::args().any(|arg| arg == "--wl-copy") {
-                std::io::copy(&mut std::io::stdin(), &mut std::io::empty())
-                    .wrap_err("reading stdin in --wl-copy mode")?;
-            }
-
-            socket
-                .write_all(&[MESSAGE_STORE])
-                .wrap_err("writing request type")?;
-        }
         "display" => display::main(&socket_path)?,
-        _ => panic!("invalid mode"),
+        _ => panic!("invalid mode, supported: daemon, display"),
     }
 
     Ok(())

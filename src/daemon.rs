@@ -2,24 +2,19 @@ use super::HistoryItem;
 use super::MAX_ENTRY_SIZE;
 use eframe::egui::ahash::HashSet;
 use eyre::Context;
+use eyre::bail;
 use std::collections::HashMap;
-use std::io::BufWriter;
-use std::io::Read;
+use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::net::UnixListener;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU64};
 use std::time::Duration;
 use std::time::SystemTime;
-use wayland_client::Dispatch;
-use wayland_client::Proxy;
-use wayland_client::backend::ObjectId;
-use wayland_client::event_created_child;
-use wayland_client::globals::GlobalListContents;
-use wayland_client::globals::registry_queue_init;
+use tracing::info;
+use tracing::warn;
+use tracing_subscriber::EnvFilter;
+use wayland_client::{Dispatch, Proxy, QueueHandle, backend::ObjectId, event_created_child};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
@@ -29,14 +24,18 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
-use wl_clipboard_rs::paste::ClipboardType;
-use wl_clipboard_rs::paste::MimeType;
-use wl_clipboard_rs::paste::Seat;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::ExtDataControlSourceV1;
 
-struct HistoryState {
-    next_item_id: Arc<AtomicU64>,
-    last_copied_item_id: Arc<AtomicU64>,
-    items: Arc<Mutex<Vec<HistoryItem>>>,
+struct SharedState {
+    next_item_id: AtomicU64,
+    // for deduplication because the event stream will tell us that we just copied something :)
+    last_copied_item_id: AtomicU64,
+    items: Mutex<Vec<HistoryItem>>,
+
+    data_control_manager: OnceLock<ExtDataControlManagerV1>,
+    data_control_devices: Mutex<HashMap</*seat global name */ u32, ExtDataControlDeviceV1>>,
+    qh: QueueHandle<WlState>,
 }
 
 struct InProgressOffer {
@@ -52,22 +51,80 @@ struct CurrentSelection {
 }
 
 struct WlState {
-    history_state: Arc<HistoryState>,
+    shared_state: Arc<SharedState>,
+
+    /// wl_seat that arrived before the data control manager so we weren't able to grab their device immediatly.
+    deferred_seats: Vec<WlSeat>,
 
     offers: HashMap<ObjectId, InProgressOffer>,
     current_primary_selection: Option<CurrentSelection>,
     current_selection: Option<CurrentSelection>,
 }
 
-impl Dispatch<WlRegistry, GlobalListContents> for WlState {
+impl Dispatch<WlRegistry, ()> for WlState {
     fn event(
-        _state: &mut Self,
-        _proxy: &WlRegistry,
-        _event: <WlRegistry as wayland_client::Proxy>::Event,
-        _data: &GlobalListContents,
+        state: &mut Self,
+        proxy: &WlRegistry,
+        event: <WlRegistry as wayland_client::Proxy>::Event,
+        _data: &(),
         _conn: &wayland_client::Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
+        qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        match event {
+            wayland_client::protocol::wl_registry::Event::Global {
+                name,
+                interface,
+                version: _, // we only need version 1
+            } => {
+                if interface == WlSeat::interface().name {
+                    info!("A new seat was connected");
+                    let seat: WlSeat = proxy.bind(name, 1, qhandle, ());
+
+                    match state.shared_state.data_control_manager.get() {
+                        None => {
+                            state.deferred_seats.push(seat);
+                        }
+                        Some(manager) => {
+                            let device = manager.get_data_device(&seat, qhandle, ());
+                            state
+                                .shared_state
+                                .data_control_devices
+                                .lock()
+                                .unwrap()
+                                .insert(name, device);
+                        }
+                    }
+                } else if interface == ExtDataControlManagerV1::interface().name {
+                    let manager: ExtDataControlManagerV1 = proxy.bind(name, 1, qhandle, ());
+
+                    for seat in state.deferred_seats.drain(..) {
+                        let device = manager.get_data_device(&seat, qhandle, ());
+                        state
+                            .shared_state
+                            .data_control_devices
+                            .lock()
+                            .unwrap()
+                            .insert(name, device);
+                    }
+
+                    state
+                        .shared_state
+                        .data_control_manager
+                        .set(manager)
+                        .expect("ext_data_control_manager_v1 already set, global appeared twice?");
+                }
+            }
+            wayland_client::protocol::wl_registry::Event::GlobalRemove { name } => {
+                // try to remove, if it's not a wl_seat it may not exist
+                state
+                    .shared_state
+                    .data_control_devices
+                    .lock()
+                    .unwrap()
+                    .remove(&name);
+            }
+            _ => {}
+        }
     }
 }
 impl Dispatch<ExtDataControlManagerV1, ()> for WlState {
@@ -93,6 +150,12 @@ impl Dispatch<WlSeat, ()> for WlState {
     }
 }
 impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
+    #[tracing::instrument(
+        skip(state, _proxy, event, _data, _conn, _qhandle),
+        level = "info",
+        ret,
+        target = "ExtDataControlDeviceV1::event"
+    )]
     fn event(
         state: &mut Self,
         _proxy: &ExtDataControlDeviceV1,
@@ -141,8 +204,8 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                         .iter()
                         .find(|mime| offer.mime_types.contains(**mime))
                     else {
-                        eprintln!(
-                            "WARN: No supported mime type found. Found mime types: {:?}",
+                        warn!(
+                            "No supported mime type found. Found mime types: {:?}",
                             offer.mime_types
                         );
                         return;
@@ -151,14 +214,14 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                     let (reader, writer) = std::io::pipe().unwrap();
                     offer.offer.receive(mime.to_string(), writer.as_fd());
 
-                    let history_state = state.history_state.clone();
+                    let history_state = state.shared_state.clone();
                     let mime = mime.to_string();
                     let time = offer.time;
                     std::thread::spawn(move || {
                         let result =
                             do_read_clipboard_into_history(&history_state, time, mime, reader);
                         if let Err(err) = result {
-                            eprintln!("WARN: Failed to read clipboard: {:?}", err)
+                            warn!("Failed to read clipboard: {:?}", err)
                         }
                     });
                 }
@@ -182,6 +245,9 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                 }
 
                 state.current_primary_selection = new_offer;
+            }
+            ext_data_control_device_v1::Event::Finished => {
+                warn!("device finished :(");
             }
             _ => {}
         }
@@ -212,7 +278,54 @@ impl Dispatch<ExtDataControlOfferV1, ()> for WlState {
     }
 }
 
+impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
+    #[tracing::instrument(
+        skip(_state, proxy, event, data, _conn, _qhandle),
+        level = "info",
+        ret,
+        target = "ExtDataControlSourceV1::event"
+    )]
+    fn event(
+        _state: &mut Self,
+        proxy: &ExtDataControlSourceV1,
+        event: <ExtDataControlSourceV1 as Proxy>::Event,
+        data: &OfferData,
+        _conn: &wayland_client::Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type: _, fd } => {
+                info!("pasting {:?}", std::str::from_utf8(&data.0));
+
+                let data = data.0.clone();
+
+                std::thread::spawn(move || {
+                    let mut writer = BufWriter::new(PipeWriter::from(fd));
+
+                    let result = writer.write_all(&data);
+                    if let Err(err) = result {
+                        warn!("Failed to write to requester: {:?}", err);
+                    }
+                    let result = writer.into_inner();
+                    if let Err(err) = result {
+                        warn!("Failed to write to requester: {:?}", err);
+                    }
+                });
+            }
+            ext_data_control_source_v1::Event::Cancelled => {
+                info!("We have been replaced.");
+                proxy.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info")))
+        .init();
+
     let _ = std::fs::remove_file(&socket_path); // lol
     let socket = UnixListener::bind(&socket_path)
         .wrap_err_with(|| format!("binding path {}", socket_path.display()))?;
@@ -220,53 +333,70 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     let conn =
         wayland_client::Connection::connect_to_env().wrap_err("connecting to the compositor")?;
 
-    let (globals, mut queue) =
-        registry_queue_init::<WlState>(&conn).wrap_err("initializing wayland connection")?;
+    let mut queue = conn.new_event_queue::<WlState>();
 
-    let data_manager = globals.bind::<ExtDataControlManagerV1, _, _>(&queue.handle(), 1..=1, ()).wrap_err("getting ext_data_control_manager_v1, is ext-data-control-v1 not supported by the compositor?")?;
+    let shared_state = Arc::new(SharedState {
+        next_item_id: AtomicU64::new(0),
+        last_copied_item_id: AtomicU64::new(u64::MAX),
+        items: Mutex::new(Vec::<HistoryItem>::new()),
 
-    let seat = globals
-        .bind::<WlSeat, _, _>(&queue.handle(), 1..=1, ())
-        .wrap_err("getting seat")?;
-
-    let data_device = data_manager.get_data_device(&seat, &queue.handle(), ());
-
-    let history_state = Arc::new(HistoryState {
-        next_item_id: Arc::new(AtomicU64::new(0)),
-        last_copied_item_id: Arc::new(AtomicU64::new(u64::MAX)),
-        items: Arc::new(Mutex::new(Vec::<HistoryItem>::new())),
-        // for deduplication because the event stream will tell us that we just copied something :)
+        data_control_manager: OnceLock::new(),
+        data_control_devices: Mutex::new(HashMap::new()),
+        qh: queue.handle(),
     });
 
-    let history_state2 = history_state.clone();
-    std::thread::spawn(move || {
-        let mut state = WlState {
-            offers: HashMap::new(),
-            current_primary_selection: None,
-            current_selection: None,
+    let history_state2 = shared_state.clone();
 
-            history_state: history_state2,
-        };
+    let mut wl_state = WlState {
+        offers: HashMap::new(),
+        current_primary_selection: None,
+        current_selection: None,
+        deferred_seats: Vec::new(),
+
+        shared_state: history_state2,
+    };
+
+    conn.display().get_registry(&queue.handle(), ());
+
+    queue
+        .roundtrip(&mut wl_state)
+        .wrap_err("failed to set up wayland state")?;
+
+    if wl_state.shared_state.data_control_manager.get().is_none() {
+        bail!(
+            "{} not found, the ext-data-control-v1 Wayland extension is likely unsupported by your compositor.\n\
+            check https://wayland.app/protocols/ext-data-control-v1#compositor-support
+            ",
+            ExtDataControlManagerV1::interface().name
+        );
+    }
+
+    std::thread::spawn(move || {
         loop {
-            queue.blocking_dispatch(&mut state);
+            let result = queue
+                .blocking_dispatch(&mut wl_state)
+                .wrap_err("handling wayland");
+            if let Err(err) = result {
+                warn!("Received error from Wayland: {:?}", err);
+            }
         }
     });
 
-    println!("INFO: Listening on {}", socket_path.display());
+    info!("Listening on {}", socket_path.display());
 
     for peer in socket.incoming() {
         match peer {
             Ok(peer) => {
-                let history_state = history_state.clone();
+                let history_state = shared_state.clone();
                 std::thread::spawn(move || {
                     let result = handle_peer(peer, &history_state);
                     if let Err(err) = result {
-                        eprintln!("ERROR: Error handling peer: {err:?}");
+                        warn!("Error handling peer: {err:?}");
                     }
                 });
             }
             Err(err) => {
-                eprintln!("ERROR: Error accepting peer: {err}");
+                warn!("Error accepting peer: {err}");
             }
         }
     }
@@ -274,91 +404,84 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     Ok(())
 }
 
-fn handle_peer(mut peer: UnixStream, history_state: &HistoryState) -> eyre::Result<()> {
+#[tracing::instrument(skip(peer, shared_state), level = "info")]
+fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result<()> {
     let mut request = [0; 1];
     let Ok(()) = peer.read_exact(&mut request) else {
         return Ok(());
     };
     match request[0] {
-        super::MESSAGE_STORE => {
-            handle_store(history_state).wrap_err("handling store message")?;
-        }
         super::MESSAGE_READ => {
-            let items = history_state.items.lock().unwrap();
+            let items = shared_state.items.lock().unwrap();
 
             ciborium::into_writer(items.as_slice(), BufWriter::new(peer))
                 .wrap_err("writing items to socket")?;
         }
         super::MESSAGE_COPY => {
-            handle_copy(peer, history_state).wrap_err("handling copy message")?;
+            handle_copy(peer, shared_state).wrap_err("handling copy message")?;
         }
         _ => {}
     };
     Ok(())
 }
 
-fn handle_copy(mut peer: UnixStream, history_state: &HistoryState) -> Result<(), eyre::Error> {
+struct OfferData(Arc<[u8]>);
+
+fn handle_copy(mut peer: UnixStream, shared_state: &SharedState) -> Result<(), eyre::Error> {
     let mut id = [0; 8];
     peer.read_exact(&mut id).wrap_err("failed to read id")?;
     let id = u64::from_le_bytes(id);
-    let mut items = history_state.items.lock().unwrap();
+    let mut items = shared_state.items.lock().unwrap();
     let Some(idx) = items.iter().position(|item| item.id == id) else {
         return Ok(());
     };
     let entry = items.remove(idx);
     items.push(entry.clone());
-    let mut opts = wl_clipboard_rs::copy::Options::new();
-    opts.clipboard(wl_clipboard_rs::copy::ClipboardType::Regular)
-        .seat(wl_clipboard_rs::copy::Seat::All);
-    let result = wl_clipboard_rs::copy::copy(
-        opts,
-        wl_clipboard_rs::copy::Source::Bytes(entry.data.into_boxed_slice()),
-        wl_clipboard_rs::copy::MimeType::Specific(entry.mime),
-    );
-    history_state
+
+    drop(items);
+
+    for device in &*shared_state.data_control_devices.lock().unwrap() {
+        let data_source = shared_state
+            .data_control_manager
+            .get()
+            .expect("data manger not found")
+            .create_data_source(&shared_state.qh, OfferData(entry.data.clone()));
+
+        if entry.mime == "text/plain" {
+            // Just like wl_clipboard_rs, we also offer some extra mimes for text.
+            let text_mimes = [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "STRING",
+                "UTF8_STRING",
+                "TEXT",
+            ];
+            for mime in text_mimes {
+                data_source.offer(mime.to_string());
+            }
+        }
+
+        data_source.offer(entry.mime.clone());
+
+        info!("setting the selection");
+
+        device.1.set_selection(Some(&data_source));
+    }
+
+    shared_state
         .last_copied_item_id
         .store(entry.id, std::sync::atomic::Ordering::Relaxed);
-    if let Err(err) = result {
-        println!("WARNING: Copy failed: {err:?}");
-    }
-    Ok(())
-}
 
-fn handle_store(history_state: &HistoryState) -> Result<(), eyre::Error> {
-    let time = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-
-    let mime_types =
-        wl_clipboard_rs::paste::get_mime_types(ClipboardType::Regular, Seat::Unspecified)
-            .wrap_err("getting mime types")?;
-
-    let Some(mime) = ["text/plain", "image/png"]
-        .iter()
-        .find(|mime| mime_types.contains(**mime))
-    else {
-        eprintln!("WARN: No supported mime type found. Found mime types: {mime_types:?}");
-        return Ok(());
-    };
-
-    let (data_readear, _) = wl_clipboard_rs::paste::get_contents(
-        ClipboardType::Regular,
-        Seat::Unspecified,
-        MimeType::Specific(mime),
-    )
-    .wrap_err("getting contents")?;
-
-    do_read_clipboard_into_history(&history_state, time, mime.to_string(), data_readear)?;
     Ok(())
 }
 
 fn do_read_clipboard_into_history(
-    history_state: &HistoryState,
+    history_state: &SharedState,
     time: std::time::Duration,
     mime: String,
     data_reader: impl Read,
 ) -> Result<(), eyre::Error> {
-    let mut data_reader = data_reader.take(MAX_ENTRY_SIZE);
+    let mut data_reader = BufReader::new(data_reader).take(MAX_ENTRY_SIZE);
     let mut data = Vec::new();
     data_reader
         .read_to_end(&mut data)
@@ -368,7 +491,7 @@ fn do_read_clipboard_into_history(
             .next_item_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         mime: mime.to_string(),
-        data,
+        data: data.into(),
         created_time: u64::try_from(time.as_millis()).unwrap(),
     };
     let mut items = history_state.items.lock().unwrap();
@@ -376,7 +499,7 @@ fn do_read_clipboard_into_history(
         .last()
         .is_some_and(|last| last.mime == new_entry.mime && last.data == new_entry.data)
     {
-        println!("INFO: Skipping store of new item because it is identical to last one");
+        info!("INFO: Skipping store of new item because it is identical to last one");
         return Ok(());
     }
     let last_copied = history_state
@@ -386,7 +509,7 @@ fn do_read_clipboard_into_history(
         && item.mime == new_entry.mime
         && item.data == new_entry.data
     {
-        println!("INFO: Skipping store of new item because the copy came from us");
+        info!("Skipping store of new item because the copy came from us");
         return Ok(());
     }
     items.push(new_entry);
@@ -399,15 +522,15 @@ fn do_read_clipboard_into_history(
         }
     }
     if let Some(cutoff) = cutoff {
-        println!(
-            "INFO: Dropping old {} items because limit of {} bytes was reached for the history",
+        info!(
+            "Dropping old {} items because limit of {} bytes was reached for the history",
             cutoff + 1,
             crate::MAX_HISTORY_BYTE_SIZE
         );
         items.splice(0..=cutoff, []);
     }
-    println!(
-        "INFO: Successfully stored clipboard value of mime type {mime} (new history size {running_total})"
+    info!(
+        "Successfully stored clipboard value of mime type {mime} (new history size {running_total})"
     );
     Ok(())
 }
