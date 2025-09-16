@@ -8,7 +8,7 @@ const MAX_ENTRY_SIZE: u64 = 50_000_000;
 const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
-struct Entry {
+struct HistoryItem {
     id: u64,
     mime: String,
     data: Vec<u8>,

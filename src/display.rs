@@ -12,10 +12,10 @@ use std::{
     time::Instant,
 };
 
-use super::Entry;
+use super::HistoryItem;
 
 pub(crate) struct App {
-    pub(crate) items: Vec<Entry>,
+    pub(crate) items: Vec<HistoryItem>,
     pub(crate) selected_idx: usize,
     pub(crate) socket: UnixStream,
 }
@@ -85,6 +85,10 @@ impl eframe::App for App {
 
                 ui.add_space(10.0);
 
+                ui.label(format!("MIME type: {}", item.mime));
+
+                ui.add_space(10.0);
+
                 match item.mime.as_str() {
                     "text/plain" => {
                         ui.label(str::from_utf8(&item.data).unwrap_or("<invalid UTF-8>"));
@@ -117,7 +121,7 @@ pub fn main(socket_path: &Path) -> eyre::Result<()> {
 
     println!("INFO: Reading clipboard history from socket");
     let start = Instant::now();
-    let mut items: Vec<Entry> =
+    let mut items: Vec<HistoryItem> =
         ciborium::from_reader(BufReader::new(socket)).wrap_err("reading items from socket")?;
     println!(
         "INFO: Read clipboard history from socket in {:?}",
