@@ -3,7 +3,11 @@ use super::MAX_ENTRY_SIZE;
 use eframe::egui::ahash::HashSet;
 use eyre::Context;
 use eyre::bail;
+use rustix::fs::OFlags;
+use rustix::fs::fcntl_setfl;
+use rustix::io::FdFlags;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -11,12 +15,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU64};
 use std::time::Duration;
 use std::time::SystemTime;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
-use wayland_client::{Dispatch, Proxy, QueueHandle, backend::ObjectId, event_created_child};
+use wayland_client::protocol::wl_callback::WlCallback;
+use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::{Dispatch, Proxy, QueueHandle, backend::ObjectId, event_created_child};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
     EVT_DATA_OFFER_OPCODE, ExtDataControlDeviceV1,
@@ -32,10 +39,12 @@ struct SharedState {
     // for deduplication because the event stream will tell us that we just copied something :)
     last_copied_item_id: AtomicU64,
     items: Mutex<Vec<HistoryItem>>,
+    select_history_send: tokio::sync::mpsc::Sender<HistoryItem>,
 
     data_control_manager: OnceLock<ExtDataControlManagerV1>,
     data_control_devices: Mutex<HashMap</*seat global name */ u32, ExtDataControlDeviceV1>>,
     qh: QueueHandle<WlState>,
+    d: WlDisplay,
 }
 
 struct InProgressOffer {
@@ -59,6 +68,19 @@ struct WlState {
     offers: HashMap<ObjectId, InProgressOffer>,
     current_primary_selection: Option<CurrentSelection>,
     current_selection: Option<CurrentSelection>,
+}
+
+impl Dispatch<WlCallback, String> for WlState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlCallback,
+        _event: <WlCallback as Proxy>::Event,
+        data: &String,
+        _conn: &wayland_client::Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        info!("Received sync back {data}");
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for WlState {
@@ -199,7 +221,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
 
                 state.current_selection = new_offer;
 
-                if let Some(offer) = &state.current_selection {
+                if let Some(offer) = state.current_selection.take() {
                     let Some(mime) = ["text/plain", "image/png"]
                         .iter()
                         .find(|mime| offer.mime_types.contains(**mime))
@@ -223,6 +245,8 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                         if let Err(err) = result {
                             warn!("Failed to read clipboard: {:?}", err)
                         }
+
+                        offer.offer.destroy();
                     });
                 }
             }
@@ -333,16 +357,30 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     let conn =
         wayland_client::Connection::connect_to_env().wrap_err("connecting to the compositor")?;
 
+    rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
+
     let mut queue = conn.new_event_queue::<WlState>();
+
+    let (select_history_send, mut select_history_recv) =
+        tokio::sync::mpsc::channel::<HistoryItem>(1);
 
     let shared_state = Arc::new(SharedState {
         next_item_id: AtomicU64::new(0),
         last_copied_item_id: AtomicU64::new(u64::MAX),
         items: Mutex::new(Vec::<HistoryItem>::new()),
+        select_history_send,
 
         data_control_manager: OnceLock::new(),
         data_control_devices: Mutex::new(HashMap::new()),
         qh: queue.handle(),
+        d: conn.display(),
+    });
+
+    shared_state.items.lock().unwrap().push(HistoryItem {
+        id: 3548235782,
+        mime: "text/plain".into(),
+        data: b"meow".to_vec().into(),
+        created_time: 0,
     });
 
     let history_state2 = shared_state.clone();
@@ -372,14 +410,50 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     }
 
     std::thread::spawn(move || {
-        loop {
-            let result = queue
-                .blocking_dispatch(&mut wl_state)
-                .wrap_err("handling wayland");
-            if let Err(err) = result {
-                warn!("Received error from Wayland: {:?}", err);
-            }
-        }
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                loop {
+                    info!("about to cook");
+
+                    queue.dispatch_pending(&mut wl_state).expect("todo");
+
+                    let read_guard = queue.prepare_read().expect("todo");
+
+                    let fd =
+                        tokio::io::unix::AsyncFd::new(read_guard.connection_fd()).expect("todo");
+
+                    info!("gonna wait, maybe forever");
+
+                    tokio::select! {
+                        result = fd.readable() => {
+                            info!("we are ready to read!");
+                            if let Err(err) = result {
+                                error!("Received error from Wayland: {:?}", err);
+                                std::process::exit(1);
+                            }
+
+                            drop(fd);
+
+                            read_guard.read().expect("todo");
+                        }
+                        item = select_history_recv.recv() => {
+                            info!("received thing from channel");
+                            match item {
+                                None => {
+                                    error!("IPC socket thread hung up");
+                                    std::process::exit(1);
+                                }
+                                Some(item) => {
+                                    do_copy_into_clipboard(item, &wl_state.shared_state);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
     });
 
     info!("Listening on {}", socket_path.display());
@@ -437,15 +511,27 @@ fn handle_copy(mut peer: UnixStream, shared_state: &SharedState) -> Result<(), e
     };
     let entry = items.remove(idx);
     items.push(entry.clone());
+    shared_state.select_history_send.try_send(entry)?;
+    Ok(())
+}
 
-    drop(items);
-
+fn do_copy_into_clipboard(
+    entry: HistoryItem,
+    shared_state: &SharedState,
+) -> Result<(), eyre::Error> {
     for device in &*shared_state.data_control_devices.lock().unwrap() {
+        shared_state
+            .d
+            .sync(&shared_state.qh, "before create_data_source".into());
         let data_source = shared_state
             .data_control_manager
             .get()
             .expect("data manger not found")
             .create_data_source(&shared_state.qh, OfferData(entry.data.clone()));
+
+        shared_state
+            .d
+            .sync(&shared_state.qh, "after create_data_source".into());
 
         if entry.mime == "text/plain" {
             // Just like wl_clipboard_rs, we also offer some extra mimes for text.
@@ -459,13 +545,21 @@ fn handle_copy(mut peer: UnixStream, shared_state: &SharedState) -> Result<(), e
             for mime in text_mimes {
                 data_source.offer(mime.to_string());
             }
+        } else {
+            data_source.offer(entry.mime.clone());
         }
 
-        data_source.offer(entry.mime.clone());
+        shared_state
+            .d
+            .sync(&shared_state.qh, "before set_selection".into());
 
         info!("setting the selection");
 
         device.1.set_selection(Some(&data_source));
+
+        shared_state
+            .d
+            .sync(&shared_state.qh, "setting the selection".into());
     }
 
     shared_state
