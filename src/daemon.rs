@@ -7,10 +7,7 @@ use eyre::bail;
 use rustix::event::PollFd;
 use rustix::event::PollFlags;
 use rustix::fs::OFlags;
-use rustix::fs::fcntl_setfl;
-use rustix::io::FdFlags;
 use std::collections::HashMap;
-use std::future::poll_fn;
 use std::io::PipeReader;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
@@ -24,11 +21,9 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use wayland_client::EventQueue;
-use wayland_client::protocol::wl_callback::WlCallback;
-use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
-use wayland_client::{Dispatch, Proxy, QueueHandle, backend::ObjectId, event_created_child};
+use wayland_client::{Dispatch, Proxy, QueueHandle, event_created_child};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
     EVT_DATA_OFFER_OPCODE, ExtDataControlDeviceV1,
@@ -39,28 +34,20 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1:
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::ExtDataControlSourceV1;
 
+const MIME_TYPES: &[&str] = &["text/plain", "image/png", "image/jpg"];
+
 struct SharedState {
     next_item_id: AtomicU64,
-    // for deduplication because the event stream will tell us that we just copied something :)
-    last_copied_item_id: AtomicU64,
     items: Mutex<Vec<HistoryItem>>,
     notify_write_send: PipeWriter,
 
     data_control_manager: OnceLock<ExtDataControlManagerV1>,
     data_control_devices: Mutex<HashMap</*seat global name */ u32, ExtDataControlDeviceV1>>,
     qh: QueueHandle<WlState>,
-    d: WlDisplay,
 }
 
 struct InProgressOffer {
-    mime_types: HashSet<String>,
-    time: Duration,
-}
-
-#[derive(Debug)]
-struct CurrentSelection {
-    mime_types: HashSet<String>,
-    offer: ExtDataControlOfferV1,
+    mime_types: Mutex<HashSet<String>>,
     time: Duration,
 }
 
@@ -69,23 +56,6 @@ struct WlState {
 
     /// wl_seat that arrived before the data control manager so we weren't able to grab their device immediatly.
     deferred_seats: Vec<WlSeat>,
-
-    offers: HashMap<ObjectId, InProgressOffer>,
-    current_primary_selection: Option<CurrentSelection>,
-    current_selection: Option<CurrentSelection>,
-}
-
-impl Dispatch<WlCallback, String> for WlState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlCallback,
-        _event: <WlCallback as Proxy>::Event,
-        data: &String,
-        _conn: &wayland_client::Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-        info!("Received sync back {data}");
-    }
 }
 
 impl Dispatch<WlRegistry, ()> for WlState {
@@ -163,6 +133,7 @@ impl Dispatch<ExtDataControlManagerV1, ()> for WlState {
         _conn: &wayland_client::Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        // no events at the time of writing
     }
 }
 impl Dispatch<WlSeat, ()> for WlState {
@@ -174,6 +145,7 @@ impl Dispatch<WlSeat, ()> for WlState {
         _conn: &wayland_client::Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        // we don't care about anything about the seat
     }
 }
 impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
@@ -186,88 +158,49 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
-            // A new offer is being prepared, register it and don't do anything yet
-            ext_data_control_device_v1::Event::DataOffer { id } => {
-                state.offers.insert(
-                    id.id(),
-                    InProgressOffer {
-                        mime_types: Default::default(),
-                        time: SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap(),
-                    },
-                );
+            ext_data_control_device_v1::Event::DataOffer { id: _ } => {
+                // A new offer is being prepared, we created the associated data in its creation and don't need to do anything
             }
 
             // The selection has been confirmed, we just properly got a new offer that we should use.
             ext_data_control_device_v1::Event::Selection { id } => {
-                let new_offer = match id {
-                    Some(id) => {
-                        let offer = state.offers.remove(&id.id());
+                if let Some(offer) = id {
+                    let offer_data = offer
+                        .data::<InProgressOffer>()
+                        .expect("missing InProgressOffer data for ExtDataControlOfferV1");
 
-                        offer.map(|offer| CurrentSelection {
-                            offer: id,
-                            mime_types: offer.mime_types,
-                            time: offer.time,
-                        })
-                    }
-                    None => None,
-                };
-
-                if let Some(current) = &state.current_selection {
-                    current.offer.destroy();
-                }
-
-                state.current_selection = new_offer;
-
-                if let Some(offer) = state.current_selection.take() {
-                    let Some(mime) = ["text/plain", "image/png"]
-                        .iter()
-                        .find(|mime| offer.mime_types.contains(**mime))
+                    let mime_types = offer_data.mime_types.lock().unwrap();
+                    let Some(mime) = MIME_TYPES.iter().find(|mime| mime_types.contains(**mime))
                     else {
                         warn!(
                             "No supported mime type found. Found mime types: {:?}",
-                            offer.mime_types
+                            offer_data.mime_types
                         );
                         return;
                     };
+                    drop(mime_types);
 
                     let (reader, writer) = std::io::pipe().unwrap();
-                    offer.offer.receive(mime.to_string(), writer.as_fd());
+                    offer.receive(mime.to_string(), writer.as_fd());
 
                     let history_state = state.shared_state.clone();
                     let mime = mime.to_string();
-                    let time = offer.time;
+                    let time = offer_data.time;
                     std::thread::spawn(move || {
-                        let result =
-                            do_read_clipboard_into_history(&history_state, time, mime, reader);
+                        let result = read_fd_into_history(&history_state, time, mime, reader);
                         if let Err(err) = result {
                             warn!("Failed to read clipboard: {:?}", err)
                         }
 
-                        offer.offer.destroy();
+                        offer.destroy();
                     });
                 }
             }
+            // The offer has been confirmed to be a primary selection, do the necessary bookkeeping but we don't really care.
             ext_data_control_device_v1::Event::PrimarySelection { id } => {
-                let new_offer = match id {
-                    Some(id) => {
-                        let offer = state.offers.remove(&id.id());
-
-                        offer.map(|offer| CurrentSelection {
-                            offer: id,
-                            mime_types: offer.mime_types,
-                            time: offer.time,
-                        })
-                    }
-                    None => None,
-                };
-
-                if let Some(current) = &state.current_primary_selection {
-                    current.offer.destroy();
+                if let Some(id) = id {
+                    id.destroy();
                 }
-
-                state.current_primary_selection = new_offer;
             }
             ext_data_control_device_v1::Event::Finished => {
                 warn!("device finished :(");
@@ -277,24 +210,27 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
     }
 
     event_created_child!(WlState, ExtDataControlDeviceV1, [
-        EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+        EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, InProgressOffer {
+            mime_types: Default::default(),
+            time: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap(),
+        }),
     ]);
 }
 
-impl Dispatch<ExtDataControlOfferV1, ()> for WlState {
+impl Dispatch<ExtDataControlOfferV1, InProgressOffer> for WlState {
     fn event(
-        state: &mut Self,
-        proxy: &ExtDataControlOfferV1,
+        _state: &mut Self,
+        _proxy: &ExtDataControlOfferV1,
         event: <ExtDataControlOfferV1 as wayland_client::Proxy>::Event,
-        _data: &(),
+        data: &InProgressOffer,
         _conn: &wayland_client::Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
             ext_data_control_offer_v1::Event::Offer { mime_type } => {
-                if let Some(offer) = state.offers.get_mut(&proxy.id()) {
-                    offer.mime_types.insert(mime_type);
-                }
+                data.mime_types.lock().unwrap().insert(mime_type);
             }
             _ => {}
         }
@@ -312,8 +248,6 @@ impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
     ) {
         match event {
             ext_data_control_source_v1::Event::Send { mime_type: _, fd } => {
-                info!("pasting {:?}", std::str::from_utf8(&data.0));
-
                 let data = data.0.clone();
 
                 std::thread::spawn(move || {
@@ -330,12 +264,169 @@ impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
                 });
             }
             ext_data_control_source_v1::Event::Cancelled => {
-                info!("We have been replaced.");
                 proxy.destroy();
             }
             _ => {}
         }
     }
+}
+
+fn do_copy_into_clipboard(
+    entry: HistoryItem,
+    shared_state: &SharedState,
+) -> Result<(), eyre::Error> {
+    for device in &*shared_state.data_control_devices.lock().unwrap() {
+        let data_source = shared_state
+            .data_control_manager
+            .get()
+            .expect("data manger not found")
+            .create_data_source(&shared_state.qh, OfferData(entry.data.clone()));
+
+        if entry.mime == "text/plain" {
+            // Just like wl_clipboard_rs, we also offer some extra mimes for text.
+            let text_mimes = [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "STRING",
+                "UTF8_STRING",
+                "TEXT",
+            ];
+            for mime in text_mimes {
+                data_source.offer(mime.to_string());
+            }
+        } else {
+            data_source.offer(entry.mime.clone());
+        }
+
+        device.1.set_selection(Some(&data_source));
+    }
+
+    Ok(())
+}
+
+fn dispatch_wayland(
+    mut queue: EventQueue<WlState>,
+    mut wl_state: WlState,
+    notify_write_recv: PipeReader,
+) -> eyre::Result<()> {
+    loop {
+        queue
+            .dispatch_pending(&mut wl_state)
+            .wrap_err("dispatching Wayland events")?;
+
+        let read_guard = queue
+            .prepare_read()
+            .wrap_err("preparing read from Wayland socket")?;
+        let _ = queue.flush();
+
+        let pollfd1_read = PollFd::from_borrowed_fd(read_guard.connection_fd(), PollFlags::IN);
+        let pollfd_signal = PollFd::from_borrowed_fd(notify_write_recv.as_fd(), PollFlags::IN);
+
+        let _ = rustix::event::poll(&mut [pollfd1_read, pollfd_signal], None);
+
+        read_guard
+            .read_without_dispatch()
+            .wrap_err("reading from wayland socket")?;
+    }
+}
+
+#[tracing::instrument(skip(peer, shared_state))]
+fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result<()> {
+    let mut request = [0; 1];
+    let Ok(()) = peer.read_exact(&mut request) else {
+        return Ok(());
+    };
+    match request[0] {
+        super::MESSAGE_READ => {
+            let items = shared_state.items.lock().unwrap();
+
+            ciborium::into_writer(items.as_slice(), BufWriter::new(peer))
+                .wrap_err("writing items to socket")?;
+        }
+        super::MESSAGE_COPY => {
+            handle_copy_message(peer, shared_state).wrap_err("handling copy message")?;
+        }
+        _ => {}
+    };
+    Ok(())
+}
+
+struct OfferData(Arc<[u8]>);
+
+fn handle_copy_message(
+    mut peer: UnixStream,
+    shared_state: &SharedState,
+) -> Result<(), eyre::Error> {
+    let mut id = [0; 8];
+    peer.read_exact(&mut id).wrap_err("failed to read id")?;
+    let id = u64::from_le_bytes(id);
+    let mut items = shared_state.items.lock().unwrap();
+    let Some(idx) = items.iter().position(|item| item.id == id) else {
+        return Ok(());
+    };
+    let item = items.remove(idx);
+    items.push(item.clone());
+
+    drop(items);
+
+    do_copy_into_clipboard(item, &shared_state).wrap_err("doing copy")?;
+
+    (&shared_state.notify_write_send)
+        .write_all(&[0])
+        .wrap_err("notifying wayland thread")?;
+
+    Ok(())
+}
+
+fn read_fd_into_history(
+    history_state: &SharedState,
+    time: std::time::Duration,
+    mime: String,
+    data_reader: impl Read,
+) -> Result<(), eyre::Error> {
+    let mut data_reader = BufReader::new(data_reader).take(MAX_ENTRY_SIZE);
+    let mut data = Vec::new();
+    data_reader
+        .read_to_end(&mut data)
+        .wrap_err("reading content data")?;
+    let new_entry = HistoryItem {
+        id: history_state
+            .next_item_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        mime: mime.to_string(),
+        data: data.into(),
+        created_time: u64::try_from(time.as_millis()).unwrap(),
+    };
+    let mut items = history_state.items.lock().unwrap();
+    if items
+        .last()
+        .is_some_and(|last| last.mime == new_entry.mime && last.data == new_entry.data)
+    {
+        info!("INFO: Skipping store of new item because it is identical to last one");
+        return Ok(());
+    }
+
+    items.push(new_entry);
+    let mut running_total = 0;
+    let mut cutoff = None;
+    for (idx, item) in items.iter().enumerate().rev() {
+        running_total += item.data.len() + std::mem::size_of::<HistoryItem>();
+        if running_total > crate::MAX_HISTORY_BYTE_SIZE {
+            cutoff = Some(idx);
+        }
+    }
+    if let Some(cutoff) = cutoff {
+        info!(
+            "Dropping old {} items because limit of {} bytes was reached for the history",
+            cutoff + 1,
+            crate::MAX_HISTORY_BYTE_SIZE
+        );
+        items.splice(0..=cutoff, []);
+    }
+    info!(
+        "Successfully stored clipboard value of mime type {mime} (new history size {running_total})"
+    );
+    Ok(())
 }
 
 pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
@@ -356,29 +447,17 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
 
     let shared_state = Arc::new(SharedState {
         next_item_id: AtomicU64::new(0),
-        last_copied_item_id: AtomicU64::new(u64::MAX),
         items: Mutex::new(Vec::<HistoryItem>::new()),
         notify_write_send,
 
         data_control_manager: OnceLock::new(),
         data_control_devices: Mutex::new(HashMap::new()),
         qh: queue.handle(),
-        d: conn.display(),
-    });
-
-    shared_state.items.lock().unwrap().push(HistoryItem {
-        id: 3548235782,
-        mime: "text/plain".into(),
-        data: b"meow".to_vec().into(),
-        created_time: 0,
     });
 
     let history_state2 = shared_state.clone();
 
     let mut wl_state = WlState {
-        offers: HashMap::new(),
-        current_primary_selection: None,
-        current_selection: None,
         deferred_seats: Vec::new(),
 
         shared_state: history_state2,
@@ -428,190 +507,5 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn dispatch_wayland(
-    mut queue: EventQueue<WlState>,
-    mut wl_state: WlState,
-    notify_write_recv: PipeReader,
-) -> eyre::Result<()> {
-    loop {
-        queue
-            .dispatch_pending(&mut wl_state)
-            .wrap_err("dispatching Wayland events")?;
-
-        let read_guard = queue
-            .prepare_read()
-            .wrap_err("preparing read from Wayland socket")?;
-        let _ = queue.flush();
-
-        let pollfd1_read = PollFd::from_borrowed_fd(read_guard.connection_fd(), PollFlags::IN);
-        let pollfd_signal = PollFd::from_borrowed_fd(notify_write_recv.as_fd(), PollFlags::IN);
-
-        let _ = rustix::event::poll(&mut [pollfd1_read, pollfd_signal], None);
-
-        read_guard
-            .read_without_dispatch()
-            .wrap_err("reading from wayland socket")?;
-    }
-}
-
-#[tracing::instrument(skip(peer, shared_state), level = "info")]
-fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result<()> {
-    let mut request = [0; 1];
-    let Ok(()) = peer.read_exact(&mut request) else {
-        return Ok(());
-    };
-    match request[0] {
-        super::MESSAGE_READ => {
-            let items = shared_state.items.lock().unwrap();
-
-            ciborium::into_writer(items.as_slice(), BufWriter::new(peer))
-                .wrap_err("writing items to socket")?;
-        }
-        super::MESSAGE_COPY => {
-            handle_copy(peer, shared_state).wrap_err("handling copy message")?;
-        }
-        _ => {}
-    };
-    Ok(())
-}
-
-struct OfferData(Arc<[u8]>);
-
-fn handle_copy(mut peer: UnixStream, shared_state: &SharedState) -> Result<(), eyre::Error> {
-    let mut id = [0; 8];
-    peer.read_exact(&mut id).wrap_err("failed to read id")?;
-    let id = u64::from_le_bytes(id);
-    let mut items = shared_state.items.lock().unwrap();
-    let Some(idx) = items.iter().position(|item| item.id == id) else {
-        return Ok(());
-    };
-    let item = items.remove(idx);
-    items.push(item.clone());
-
-    drop(items);
-
-    do_copy_into_clipboard(item, &shared_state).wrap_err("doing copy")?;
-
-    (&shared_state.notify_write_send)
-        .write_all(&[0])
-        .wrap_err("notifying wayland thread")?;
-
-    Ok(())
-}
-
-fn do_copy_into_clipboard(
-    entry: HistoryItem,
-    shared_state: &SharedState,
-) -> Result<(), eyre::Error> {
-    for device in &*shared_state.data_control_devices.lock().unwrap() {
-        shared_state
-            .d
-            .sync(&shared_state.qh, "before create_data_source".into());
-        let data_source = shared_state
-            .data_control_manager
-            .get()
-            .expect("data manger not found")
-            .create_data_source(&shared_state.qh, OfferData(entry.data.clone()));
-
-        shared_state
-            .d
-            .sync(&shared_state.qh, "after create_data_source".into());
-
-        if entry.mime == "text/plain" {
-            // Just like wl_clipboard_rs, we also offer some extra mimes for text.
-            let text_mimes = [
-                "text/plain;charset=utf-8",
-                "text/plain",
-                "STRING",
-                "UTF8_STRING",
-                "TEXT",
-            ];
-            for mime in text_mimes {
-                data_source.offer(mime.to_string());
-            }
-        } else {
-            data_source.offer(entry.mime.clone());
-        }
-
-        shared_state
-            .d
-            .sync(&shared_state.qh, "before set_selection".into());
-
-        info!("setting the selection");
-
-        device.1.set_selection(Some(&data_source));
-
-        shared_state
-            .d
-            .sync(&shared_state.qh, "setting the selection".into());
-    }
-
-    shared_state
-        .last_copied_item_id
-        .store(entry.id, std::sync::atomic::Ordering::Relaxed);
-
-    Ok(())
-}
-
-fn do_read_clipboard_into_history(
-    history_state: &SharedState,
-    time: std::time::Duration,
-    mime: String,
-    data_reader: impl Read,
-) -> Result<(), eyre::Error> {
-    let mut data_reader = BufReader::new(data_reader).take(MAX_ENTRY_SIZE);
-    let mut data = Vec::new();
-    data_reader
-        .read_to_end(&mut data)
-        .wrap_err("reading content data")?;
-    let new_entry = HistoryItem {
-        id: history_state
-            .next_item_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        mime: mime.to_string(),
-        data: data.into(),
-        created_time: u64::try_from(time.as_millis()).unwrap(),
-    };
-    let mut items = history_state.items.lock().unwrap();
-    if items
-        .last()
-        .is_some_and(|last| last.mime == new_entry.mime && last.data == new_entry.data)
-    {
-        info!("INFO: Skipping store of new item because it is identical to last one");
-        return Ok(());
-    }
-    let last_copied = history_state
-        .last_copied_item_id
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if let Some(item) = items.iter().find(|item| item.id == last_copied)
-        && item.mime == new_entry.mime
-        && item.data == new_entry.data
-    {
-        info!("Skipping store of new item because the copy came from us");
-        return Ok(());
-    }
-    items.push(new_entry);
-    let mut running_total = 0;
-    let mut cutoff = None;
-    for (idx, item) in items.iter().enumerate().rev() {
-        running_total += item.data.len() + std::mem::size_of::<HistoryItem>();
-        if running_total > crate::MAX_HISTORY_BYTE_SIZE {
-            cutoff = Some(idx);
-        }
-    }
-    if let Some(cutoff) = cutoff {
-        info!(
-            "Dropping old {} items because limit of {} bytes was reached for the history",
-            cutoff + 1,
-            crate::MAX_HISTORY_BYTE_SIZE
-        );
-        items.splice(0..=cutoff, []);
-    }
-    info!(
-        "Successfully stored clipboard value of mime type {mime} (new history size {running_total})"
-    );
     Ok(())
 }
