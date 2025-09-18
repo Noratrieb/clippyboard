@@ -2,12 +2,16 @@ use super::HistoryItem;
 use super::MAX_ENTRY_SIZE;
 use eframe::egui::ahash::HashSet;
 use eyre::Context;
+use eyre::ContextCompat;
 use eyre::bail;
+use rustix::event::PollFd;
+use rustix::event::PollFlags;
 use rustix::fs::OFlags;
 use rustix::fs::fcntl_setfl;
 use rustix::io::FdFlags;
 use std::collections::HashMap;
 use std::future::poll_fn;
+use std::io::PipeReader;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,6 +23,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
+use wayland_client::EventQueue;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -39,7 +44,7 @@ struct SharedState {
     // for deduplication because the event stream will tell us that we just copied something :)
     last_copied_item_id: AtomicU64,
     items: Mutex<Vec<HistoryItem>>,
-    select_history_send: tokio::sync::mpsc::Sender<HistoryItem>,
+    notify_write_send: PipeWriter,
 
     data_control_manager: OnceLock<ExtDataControlManagerV1>,
     data_control_devices: Mutex<HashMap</*seat global name */ u32, ExtDataControlDeviceV1>>,
@@ -172,12 +177,6 @@ impl Dispatch<WlSeat, ()> for WlState {
     }
 }
 impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
-    #[tracing::instrument(
-        skip(state, _proxy, event, _data, _conn, _qhandle),
-        level = "info",
-        ret,
-        target = "ExtDataControlDeviceV1::event"
-    )]
     fn event(
         state: &mut Self,
         _proxy: &ExtDataControlDeviceV1,
@@ -303,12 +302,6 @@ impl Dispatch<ExtDataControlOfferV1, ()> for WlState {
 }
 
 impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
-    #[tracing::instrument(
-        skip(_state, proxy, event, data, _conn, _qhandle),
-        level = "info",
-        ret,
-        target = "ExtDataControlSourceV1::event"
-    )]
     fn event(
         _state: &mut Self,
         proxy: &ExtDataControlSourceV1,
@@ -357,18 +350,15 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     let conn =
         wayland_client::Connection::connect_to_env().wrap_err("connecting to the compositor")?;
 
-    rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
-
     let mut queue = conn.new_event_queue::<WlState>();
 
-    let (select_history_send, mut select_history_recv) =
-        tokio::sync::mpsc::channel::<HistoryItem>(1);
+    let (notify_write_recv, notify_write_send) = std::io::pipe().expect("todo");
 
     let shared_state = Arc::new(SharedState {
         next_item_id: AtomicU64::new(0),
         last_copied_item_id: AtomicU64::new(u64::MAX),
         items: Mutex::new(Vec::<HistoryItem>::new()),
-        select_history_send,
+        notify_write_send,
 
         data_control_manager: OnceLock::new(),
         data_control_devices: Mutex::new(HashMap::new()),
@@ -403,57 +393,20 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     if wl_state.shared_state.data_control_manager.get().is_none() {
         bail!(
             "{} not found, the ext-data-control-v1 Wayland extension is likely unsupported by your compositor.\n\
-            check https://wayland.app/protocols/ext-data-control-v1#compositor-support
+            check https://wayland.app/protocols/ext-data-control-v1#compositor-support\
             ",
             ExtDataControlManagerV1::interface().name
         );
     }
 
+    rustix::fs::fcntl_setfl(notify_write_recv.as_fd(), OFlags::NONBLOCK).expect("todo");
+    rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
+
     std::thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                loop {
-                    info!("about to cook");
-
-                    queue.dispatch_pending(&mut wl_state).expect("todo");
-
-                    let read_guard = queue.prepare_read().expect("todo");
-
-                    let fd =
-                        tokio::io::unix::AsyncFd::new(read_guard.connection_fd()).expect("todo");
-
-                    info!("gonna wait, maybe forever");
-
-                    tokio::select! {
-                        result = fd.readable() => {
-                            info!("we are ready to read!");
-                            if let Err(err) = result {
-                                error!("Received error from Wayland: {:?}", err);
-                                std::process::exit(1);
-                            }
-
-                            drop(fd);
-
-                            read_guard.read().expect("todo");
-                        }
-                        item = select_history_recv.recv() => {
-                            info!("received thing from channel");
-                            match item {
-                                None => {
-                                    error!("IPC socket thread hung up");
-                                    std::process::exit(1);
-                                }
-                                Some(item) => {
-                                    do_copy_into_clipboard(item, &wl_state.shared_state);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+        if let Err(err) = dispatch_wayland(queue, wl_state, notify_write_recv) {
+            error!("error on Wayland thread: {err:?}");
+            std::process::exit(1);
+        }
     });
 
     info!("Listening on {}", socket_path.display());
@@ -476,6 +429,32 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn dispatch_wayland(
+    mut queue: EventQueue<WlState>,
+    mut wl_state: WlState,
+    notify_write_recv: PipeReader,
+) -> eyre::Result<()> {
+    loop {
+        queue
+            .dispatch_pending(&mut wl_state)
+            .wrap_err("dispatching Wayland events")?;
+
+        let read_guard = queue
+            .prepare_read()
+            .wrap_err("preparing read from Wayland socket")?;
+        let _ = queue.flush();
+
+        let pollfd1_read = PollFd::from_borrowed_fd(read_guard.connection_fd(), PollFlags::IN);
+        let pollfd_signal = PollFd::from_borrowed_fd(notify_write_recv.as_fd(), PollFlags::IN);
+
+        let _ = rustix::event::poll(&mut [pollfd1_read, pollfd_signal], None);
+
+        read_guard
+            .read_without_dispatch()
+            .wrap_err("reading from wayland socket")?;
+    }
 }
 
 #[tracing::instrument(skip(peer, shared_state), level = "info")]
@@ -509,9 +488,17 @@ fn handle_copy(mut peer: UnixStream, shared_state: &SharedState) -> Result<(), e
     let Some(idx) = items.iter().position(|item| item.id == id) else {
         return Ok(());
     };
-    let entry = items.remove(idx);
-    items.push(entry.clone());
-    shared_state.select_history_send.try_send(entry)?;
+    let item = items.remove(idx);
+    items.push(item.clone());
+
+    drop(items);
+
+    do_copy_into_clipboard(item, &shared_state).wrap_err("doing copy")?;
+
+    (&shared_state.notify_write_send)
+        .write_all(&[0])
+        .wrap_err("notifying wayland thread")?;
+
     Ok(())
 }
 
