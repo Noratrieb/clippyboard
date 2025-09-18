@@ -16,3 +16,5 @@ clippyboard currently supports the following MIME types:
 
 It will try to read out one of them (in descending preference) and store that value and provide it later.
 If no supported MIME type is found, the clipboard entry is not stored.
+
+https://github.com/user-attachments/assets/0bfdfe39-1177-4d11-bf5a-63e738751d7a

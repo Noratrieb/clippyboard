@@ -495,6 +495,7 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
             ExtDataControlManagerV1::interface().name
         );
     }
+    
 
     rustix::fs::fcntl_setfl(notify_write_recv.as_fd(), OFlags::NONBLOCK).expect("todo");
     rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
