@@ -8,11 +8,16 @@ use rustix::event::PollFd;
 use rustix::event::PollFlags;
 use rustix::fs::OFlags;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::io;
+use std::io::ErrorKind;
 use std::io::PipeReader;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU64};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -430,11 +435,24 @@ fn read_fd_into_history(
 }
 
 pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
+    let Err(err) = main_inner(socket_path);
+
+    if let Some(ioerr) = err.downcast_ref::<io::Error>()
+        && ioerr.kind() == ErrorKind::AddrInUse
+    {
+        // no cleanup
+        return Err(err);
+    }
+
+    cleanup(socket_path);
+    Err(err)
+}
+
+pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info")))
         .init();
 
-    let _ = std::fs::remove_file(&socket_path); // lol
     let socket = UnixListener::bind(&socket_path)
         .wrap_err_with(|| format!("binding path {}", socket_path.display()))?;
 
@@ -481,9 +499,11 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
     rustix::fs::fcntl_setfl(notify_write_recv.as_fd(), OFlags::NONBLOCK).expect("todo");
     rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
 
+    let socket_path_clone = socket_path.to_owned();
     std::thread::spawn(move || {
         if let Err(err) = dispatch_wayland(queue, wl_state, notify_write_recv) {
             error!("error on Wayland thread: {err:?}");
+            cleanup(&socket_path_clone);
             std::process::exit(1);
         }
     });
@@ -507,5 +527,13 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
         }
     }
 
-    Ok(())
+    unreachable!("socket.incoming will never return None")
+}
+
+fn cleanup(socket_path: &PathBuf) {
+    static HAS_DONE_CLEANUP: AtomicBool = AtomicBool::new(false);
+
+    if !HAS_DONE_CLEANUP.swap(true, Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&socket_path);
+    }
 }

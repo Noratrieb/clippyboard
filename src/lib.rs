@@ -1,9 +1,9 @@
-mod daemon;
-mod display;
+pub mod daemon;
+pub mod display;
 
-use eyre::{OptionExt, bail};
+use eyre::OptionExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 const MAX_ENTRY_SIZE: u64 = 50_000_000;
 const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
@@ -33,20 +33,8 @@ const MESSAGE_READ: u8 = 1;
 /// Argument: One u64-bit LE value, the ID
 const MESSAGE_COPY: u8 = 2;
 
-fn main() -> eyre::Result<()> {
-    let Some(mode) = std::env::args().nth(1) else {
-        bail!("missing mode");
-    };
-
-    let socket_path = dirs::runtime_dir()
+pub fn socket_path() -> eyre::Result<PathBuf> {
+    Ok(dirs::runtime_dir()
         .ok_or_eyre("missing XDG_RUNTIME_DIR")?
-        .join("clippyboard.sock");
-
-    match mode.as_str() {
-        "daemon" => daemon::main(&socket_path)?,
-        "display" => display::main(&socket_path)?,
-        _ => panic!("invalid mode, supported: daemon, display"),
-    }
-
-    Ok(())
+        .join("clippyboard.sock"))
 }

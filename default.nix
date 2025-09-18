@@ -21,7 +21,9 @@
   ];
 
   postFixup = ''
-    wrapProgram $out/bin/clippyboard \
+    wrapProgram $out/bin/clippyboard-select \
+      --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
+    wrapProgram $out/bin/clippyboard-daemon \
       --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
   '';
 

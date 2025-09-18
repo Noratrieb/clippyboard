@@ -3,6 +3,12 @@ name = "clippyboard"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "clippyboard-daemon"
+
+[[bin]]
+name = "clippyboard-select"
+
 [dependencies]
 ciborium = "0.2.2"
 dirs = "6.0.0"
