@@ -1,23 +1,18 @@
-pub mod daemon;
-pub mod display;
+use std::{path::PathBuf, sync::Arc};
 
 use eyre::OptionExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{path::PathBuf, sync::Arc};
-
-const MAX_ENTRY_SIZE: u64 = 50_000_000;
-const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
-struct HistoryItem {
-    id: u64,
-    mime: String,
+pub struct HistoryItem {
+    pub id: u64,
+    pub mime: String,
     #[serde(
         deserialize_with = "deserialize_data",
         serialize_with = "serialize_data"
     )]
-    data: Arc<[u8]>,
-    created_time: u64,
+    pub data: Arc<[u8]>,
+    pub created_time: u64,
 }
 
 fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<[u8]>, D::Error> {

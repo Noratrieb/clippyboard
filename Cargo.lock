@@ -610,21 +610,50 @@ dependencies = [
 ]
 
 [[package]]
-name = "clippyboard"
+name = "clippyboard-clear"
+version = "0.1.0"
+dependencies = [
+ "clippyboard-shared",
+ "eyre",
+]
+
+[[package]]
+name = "clippyboard-daemon"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "clippyboard-shared",
  "ctrlc",
  "dirs",
- "eframe",
- "egui_extras",
  "eyre",
  "rustix 1.1.2",
  "serde",
  "tracing",
  "tracing-subscriber",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "clippyboard-select"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "clippyboard-shared",
+ "eframe",
+ "egui_extras",
+ "eyre",
+ "serde",
+]
+
+[[package]]
+name = "clippyboard-shared"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "eyre",
+ "serde",
 ]
 
 [[package]]

@@ -25,8 +25,6 @@
       --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
     wrapProgram $out/bin/clippyboard-daemon \
       --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
-    wrapProgram $out/bin/clippyboard-clear \
-      --suffix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
   '';
 
   cargoLock.lockFile = ./Cargo.lock;

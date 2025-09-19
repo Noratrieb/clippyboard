@@ -1,18 +1,13 @@
+use clippyboard_shared::HistoryItem;
+use clippyboard_shared::MESSAGE_COPY;
+use clippyboard_shared::MESSAGE_READ;
 use eframe::egui;
 use eyre::Context;
-
-use crate::MESSAGE_READ;
-
-use super::MESSAGE_COPY;
-
 use std::{
     io::{BufReader, Write},
     os::unix::net::UnixStream,
-    path::Path,
     time::Instant,
 };
-
-use super::HistoryItem;
 
 pub(crate) struct App {
     pub(crate) items: Vec<HistoryItem>,
@@ -112,7 +107,9 @@ impl eframe::App for App {
     }
 }
 
-pub fn main(socket_path: &Path) -> eyre::Result<()> {
+pub fn main() -> eyre::Result<()> {
+    let socket_path = clippyboard_shared::socket_path()?;
+
     let mut socket = UnixStream::connect(&socket_path).wrap_err_with(|| {
         format!(
             "connecting to socket at {}. is the daemon running?",

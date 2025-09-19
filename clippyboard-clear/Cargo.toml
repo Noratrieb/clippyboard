@@ -1,0 +1,8 @@
+[package]
+name = "clippyboard-clear"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clippyboard-shared = { path = "../clippyboard-shared" }
+eyre = "0.6.12"

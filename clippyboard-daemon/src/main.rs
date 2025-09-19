@@ -1,6 +1,4 @@
-use super::HistoryItem;
-use super::MAX_ENTRY_SIZE;
-use eframe::egui::ahash::HashSet;
+use clippyboard_shared::HistoryItem;
 use eyre::Context;
 use eyre::ContextCompat;
 use eyre::bail;
@@ -8,6 +6,7 @@ use rustix::event::PollFd;
 use rustix::event::PollFlags;
 use rustix::fs::OFlags;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io;
 use std::io::ErrorKind;
@@ -38,6 +37,9 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::ExtDataControlSourceV1;
+
+const MAX_ENTRY_SIZE: u64 = 50_000_000;
+const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 
 const MIME_TYPES: &[&str] = &["text/plain", "image/png", "image/jpg"];
 
@@ -372,16 +374,16 @@ fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result
         return Ok(());
     };
     match request[0] {
-        super::MESSAGE_READ => {
+        clippyboard_shared::MESSAGE_READ => {
             let items = shared_state.items.lock().unwrap();
 
             ciborium::into_writer(items.as_slice(), BufWriter::new(peer))
                 .wrap_err("writing items to socket")?;
         }
-        super::MESSAGE_COPY => {
+        clippyboard_shared::MESSAGE_COPY => {
             handle_copy_message(peer, shared_state).wrap_err("handling copy message")?;
         }
-        super::MESSAGE_CLEAR => {
+        clippyboard_shared::MESSAGE_CLEAR => {
             handle_clear_message(&shared_state)?;
             info!("Cleared history and clipboard");
         }
@@ -479,14 +481,16 @@ fn read_fd_into_history(
     Ok(())
 }
 
-pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
+    let socket_path = clippyboard_shared::socket_path()?;
+
     let socket_path2 = socket_path.clone();
     let _ = ctrlc::set_handler(move || {
         cleanup(&socket_path2);
         std::process::exit(130); // sigint
     });
 
-    let Err(err) = main_inner(socket_path);
+    let Err(err) = main_inner(&socket_path);
 
     if let Some(ioerr) = err.downcast_ref::<io::Error>()
         && ioerr.kind() == ErrorKind::AddrInUse
@@ -495,7 +499,7 @@ pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
         return Err(err);
     }
 
-    cleanup(socket_path);
+    cleanup(&socket_path);
     Err(err)
 }
 
