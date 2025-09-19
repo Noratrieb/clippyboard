@@ -175,23 +175,47 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                         .expect("missing InProgressOffer data for ExtDataControlOfferV1");
 
                     let mime_types = offer_data.mime_types.lock().unwrap();
+
+                    let has_password_manager_hint =
+                        mime_types.contains("x-kde-passwordManagerHint");
+
                     let Some(mime) = MIME_TYPES.iter().find(|mime| mime_types.contains(**mime))
                     else {
                         warn!(
                             "No supported mime type found. Found mime types: {:?}",
-                            offer_data.mime_types
+                            mime_types
                         );
                         return;
                     };
                     drop(mime_types);
 
+                    let history_state = state.shared_state.clone();
+                    let time = offer_data.time;
+
                     let (reader, writer) = std::io::pipe().unwrap();
                     offer.receive(mime.to_string(), writer.as_fd());
 
-                    let history_state = state.shared_state.clone();
-                    let mime = mime.to_string();
-                    let time = offer_data.time;
+                    let password_manager_hint_reader = if has_password_manager_hint {
+                        let (reader, writer) = std::io::pipe().unwrap();
+                        offer.receive(mime.to_string(), writer.as_fd());
+                        Some(reader)
+                    } else {
+                        None
+                    };
+
                     std::thread::spawn(move || {
+                        if let Some(mut password_manager_hint_reader) = password_manager_hint_reader
+                        {
+                            let mut buf = Vec::new();
+                            if password_manager_hint_reader.read_to_end(&mut buf).is_ok()
+                                && buf == b"secret"
+                            {
+                                info!("Clipboard entry is marked as secret, not storing it");
+                                return;
+                            }
+                        }
+
+                        let mime = mime.to_string();
                         let result = read_fd_into_history(&history_state, time, mime, reader);
                         if let Err(err) = result {
                             warn!("Failed to read clipboard: {:?}", err)
@@ -394,6 +418,7 @@ fn read_fd_into_history(
     data_reader
         .read_to_end(&mut data)
         .wrap_err("reading content data")?;
+
     let new_entry = HistoryItem {
         id: history_state
             .next_item_id
@@ -435,6 +460,12 @@ fn read_fd_into_history(
 }
 
 pub fn main(socket_path: &PathBuf) -> eyre::Result<()> {
+    let socket_path2 = socket_path.clone();
+    let _ = ctrlc::set_handler(move || {
+        cleanup(&socket_path2);
+        std::process::exit(130); // sigint
+    });
+
     let Err(err) = main_inner(socket_path);
 
     if let Some(ioerr) = err.downcast_ref::<io::Error>()
@@ -495,7 +526,6 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
             ExtDataControlManagerV1::interface().name
         );
     }
-    
 
     rustix::fs::fcntl_setfl(notify_write_recv.as_fd(), OFlags::NONBLOCK).expect("todo");
     rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");

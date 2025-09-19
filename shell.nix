@@ -12,6 +12,8 @@ pkgs.mkShell rec {
     libxkbcommon
   ];
 
+  CLIPPYBOARD_SOCKET = "./clippyboard.socket";
+
   LD_LIBRARY_PATH =
     builtins.foldl' (a: b: "${a}:${b}/lib") "${pkgs.vulkan-loader}/lib" buildInputs;
 }

@@ -11,6 +11,7 @@ name = "clippyboard-select"
 
 [dependencies]
 ciborium = "0.2.2"
+ctrlc = "3.5.0"
 dirs = "6.0.0"
 eframe = "0.32.2"
 egui_extras = { version = "0.32.2", features = ["image"] }

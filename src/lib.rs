@@ -34,6 +34,10 @@ const MESSAGE_READ: u8 = 1;
 const MESSAGE_COPY: u8 = 2;
 
 pub fn socket_path() -> eyre::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CLIPPYBOARD_SOCKET") {
+        return Ok(path.into());
+    }
+
     Ok(dirs::runtime_dir()
         .ok_or_eyre("missing XDG_RUNTIME_DIR")?
         .join("clippyboard.sock"))
