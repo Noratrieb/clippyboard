@@ -24,6 +24,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.input(|i| {
+                if i.key_down(egui::Key::Escape) {
+                    std::process::exit(0);
+                }
+
                 if i.key_pressed(egui::Key::J) || i.key_pressed(egui::Key::ArrowDown) {
                     if self.selected_idx + 1 != self.items.len() {
                         self.selected_idx += 1;
