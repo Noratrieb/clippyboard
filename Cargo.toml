@@ -9,6 +9,9 @@ name = "clippyboard-daemon"
 [[bin]]
 name = "clippyboard-select"
 
+[[bin]]
+name = "clippyboard-clear"
+
 [dependencies]
 ciborium = "0.2.2"
 ctrlc = "3.5.0"
@@ -22,3 +25,6 @@ tracing = { version = "0.1.41", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["staging"] }
+
+[profile.release]
+lto = "thin"

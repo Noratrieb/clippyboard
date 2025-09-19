@@ -375,6 +375,10 @@ fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result
         super::MESSAGE_COPY => {
             handle_copy_message(peer, shared_state).wrap_err("handling copy message")?;
         }
+        super::MESSAGE_CLEAR => {
+            shared_state.items.lock().unwrap().clear();
+            info!("Cleared history");
+        }
         _ => {}
     };
     Ok(())

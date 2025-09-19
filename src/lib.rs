@@ -29,9 +29,10 @@ fn serialize_data<S: Serializer>(data: &Arc<[u8]>, serializer: S) -> Result<S::O
     data.serialize(serializer)
 }
 
-const MESSAGE_READ: u8 = 1;
+pub const MESSAGE_READ: u8 = 1;
 /// Argument: One u64-bit LE value, the ID
-const MESSAGE_COPY: u8 = 2;
+pub const MESSAGE_COPY: u8 = 2;
+pub const MESSAGE_CLEAR: u8 = 3;
 
 pub fn socket_path() -> eyre::Result<PathBuf> {
     if let Some(path) = std::env::var_os("CLIPPYBOARD_SOCKET") {
