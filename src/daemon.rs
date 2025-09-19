@@ -300,6 +300,12 @@ impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
     }
 }
 
+impl SharedState {
+    fn notify_wayland_request(&self) {
+        let _ = (&self.notify_write_send).write_all(&[0]);
+    }
+}
+
 fn do_copy_into_clipboard(
     entry: HistoryItem,
     shared_state: &SharedState,
@@ -376,8 +382,8 @@ fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result
             handle_copy_message(peer, shared_state).wrap_err("handling copy message")?;
         }
         super::MESSAGE_CLEAR => {
-            shared_state.items.lock().unwrap().clear();
-            info!("Cleared history");
+            handle_clear_message(&shared_state)?;
+            info!("Cleared history and clipboard");
         }
         _ => {}
     };
@@ -404,9 +410,19 @@ fn handle_copy_message(
 
     do_copy_into_clipboard(item, &shared_state).wrap_err("doing copy")?;
 
-    (&shared_state.notify_write_send)
-        .write_all(&[0])
-        .wrap_err("notifying wayland thread")?;
+    shared_state.notify_wayland_request();
+
+    Ok(())
+}
+
+fn handle_clear_message(shared_state: &SharedState) -> eyre::Result<()> {
+    shared_state.items.lock().unwrap().clear();
+
+    for device in &*shared_state.data_control_devices.lock().unwrap() {
+        device.1.set_selection(None);
+    }
+
+    shared_state.notify_wayland_request();
 
     Ok(())
 }
