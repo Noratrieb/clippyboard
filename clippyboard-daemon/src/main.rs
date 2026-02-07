@@ -11,6 +11,7 @@ use eyre::bail;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::fmt::Display;
 use std::io;
 use std::io::ErrorKind;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
@@ -39,8 +40,9 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1:
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::ExtDataControlSourceV1;
 
-const MAX_ENTRY_SIZE: u64 = 50_000_000;
-const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
+const MEGABYTE: usize = 1024 * 1024;
+const MAX_ENTRY_SIZE: usize = 50 * MEGABYTE;
+const MAX_HISTORY_BYTE_SIZE: usize = 100 * MEGABYTE;
 
 const MIME_TYPES: &[&str] = &["text/plain", "image/png", "image/jpg"];
 
@@ -398,7 +400,7 @@ fn read_fd_into_history(
     mime: String,
     data_reader: impl Read,
 ) -> Result<(), eyre::Error> {
-    let mut data_reader = BufReader::new(data_reader).take(MAX_ENTRY_SIZE);
+    let mut data_reader = BufReader::new(data_reader).take(MAX_ENTRY_SIZE as u64);
     let mut data = Vec::new();
     data_reader
         .read_to_end(&mut data)
@@ -428,20 +430,29 @@ fn read_fd_into_history(
         running_total += item.data.len() + std::mem::size_of::<HistoryItem>();
         if running_total > crate::MAX_HISTORY_BYTE_SIZE {
             cutoff = Some(idx);
+            break;
         }
     }
     if let Some(cutoff) = cutoff {
         info!(
-            "Dropping old {} items because limit of {} bytes was reached for the history",
+            "Dropping old {} items beca{} bytes was reached for the history",
             cutoff + 1,
-            crate::MAX_HISTORY_BYTE_SIZE
+            format_history_size(crate::MAX_HISTORY_BYTE_SIZE)
         );
         items.splice(0..=cutoff, []);
     }
     info!(
-        "Successfully stored clipboard value of mime type {mime} (new history size {running_total})"
+        "Successfully stored clipboard value of mime type {mime} (new history size {})",
+        format_history_size(running_total)
     );
     Ok(())
+}
+
+fn format_history_size(size: usize) -> impl Display {
+    if size < MEGABYTE {
+        return format!("{size}B");
+    }
+    format!("{}MB", size / MEGABYTE)
 }
 
 fn main() -> eyre::Result<()> {
