@@ -529,6 +529,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb9f6e1368bd4621d2c86baa7e37de77a938adf5221e5dd3d6133340101b309e"
 dependencies = [
  "bitflags 2.9.4",
+ "nix",
  "polling",
  "rustix 1.1.2",
  "slab",
@@ -650,7 +651,6 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "ciborium",
  "clippyboard-shared",
- "ctrlc",
  "dirs",
  "eyre",
  "serde",
@@ -782,17 +782,6 @@ name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
-
-[[package]]
-name = "ctrlc"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881c5d0a13b2f1498e2306e82cbada78390e152d4b1378fb28a84f4dcd0dc4f3"
-dependencies = [
- "dispatch",
- "nix",
- "windows-sys 0.61.0",
-]
 
 [[package]]
 name = "cursor-icon"

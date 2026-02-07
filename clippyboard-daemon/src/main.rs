@@ -2,6 +2,8 @@ use calloop::EventLoop;
 use calloop::Interest;
 use calloop::Mode;
 use calloop::generic::Generic;
+use calloop::signals::Signal;
+use calloop::signals::Signals;
 use calloop_wayland_source::WaylandSource;
 use clippyboard_shared::HistoryItem;
 use eyre::Context;
@@ -12,7 +14,6 @@ use std::convert::Infallible;
 use std::io;
 use std::io::ErrorKind;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
-use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -58,13 +59,6 @@ struct SharedState {
     deferred_seats: Vec<WlSeat>,
 }
 
-impl Deref for SharedState {
-    type Target = SharedStateInner;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
 struct InProgressOffer {
     mime_types: Mutex<HashSet<String>>,
     time: Duration,
@@ -89,13 +83,14 @@ impl Dispatch<WlRegistry, ()> for SharedState {
                     info!("A new seat was connected");
                     let seat: WlSeat = proxy.bind(name, 1, qhandle, ());
 
-                    match state.data_control_manager.get() {
+                    match state.inner.data_control_manager.get() {
                         None => {
                             state.deferred_seats.push(seat);
                         }
                         Some(manager) => {
                             let device = manager.get_data_device(&seat, qhandle, ());
                             state
+                                .inner
                                 .data_control_devices
                                 .lock()
                                 .unwrap()
@@ -116,6 +111,7 @@ impl Dispatch<WlRegistry, ()> for SharedState {
                     }
 
                     state
+                        .inner
                         .data_control_manager
                         .set(manager)
                         .expect("ext_data_control_manager_v1 already set, global appeared twice?");
@@ -123,7 +119,12 @@ impl Dispatch<WlRegistry, ()> for SharedState {
             }
             wayland_client::protocol::wl_registry::Event::GlobalRemove { name } => {
                 // try to remove, if it's not a wl_seat it may not exist
-                state.data_control_devices.lock().unwrap().remove(&name);
+                state
+                    .inner
+                    .data_control_devices
+                    .lock()
+                    .unwrap()
+                    .remove(&name);
             }
             _ => {}
         }
@@ -446,12 +447,6 @@ fn read_fd_into_history(
 fn main() -> eyre::Result<()> {
     let socket_path = clippyboard_shared::socket_path()?;
 
-    let socket_path2 = socket_path.clone();
-    let _ = ctrlc::set_handler(move || {
-        cleanup(&socket_path2);
-        std::process::exit(130); // sigint
-    });
-
     let Err(err) = main_inner(&socket_path);
 
     if let Some(ioerr) = err.downcast_ref::<io::Error>()
@@ -496,7 +491,7 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
         .roundtrip(&mut shared_state)
         .wrap_err("failed to set up wayland state")?;
 
-    if shared_state.data_control_manager.get().is_none() {
+    if shared_state.inner.data_control_manager.get().is_none() {
         bail!(
             "{} not found, the ext-data-control-v1 Wayland extension is likely unsupported by your compositor.\n\
             check https://wayland.app/protocols/ext-data-control-v1#compositor-support\
@@ -511,6 +506,18 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
         .unwrap();
+
+    event_loop
+        .handle()
+        .insert_source(
+            Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
+                .wrap_err("failed to create signal listener")?,
+            |_, _, _| {
+                cleanup(socket_path);
+                std::process::exit(0);
+            },
+        )
+        .wrap_err("failed to register signalfd handlers")?;
 
     event_loop
         .handle()
