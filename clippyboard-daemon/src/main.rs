@@ -1,17 +1,18 @@
+use calloop::EventLoop;
+use calloop::Interest;
+use calloop::Mode;
+use calloop::generic::Generic;
+use calloop_wayland_source::WaylandSource;
 use clippyboard_shared::HistoryItem;
 use eyre::Context;
-use eyre::ContextCompat;
 use eyre::bail;
-use rustix::event::PollFd;
-use rustix::event::PollFlags;
-use rustix::fs::OFlags;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io;
 use std::io::ErrorKind;
-use std::io::PipeReader;
 use std::io::{BufReader, BufWriter, PipeWriter, Read, Write};
+use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -24,7 +25,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
-use wayland_client::EventQueue;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Dispatch, Proxy, QueueHandle, event_created_child};
@@ -43,14 +43,26 @@ const MAX_HISTORY_BYTE_SIZE: usize = 100_000_000;
 
 const MIME_TYPES: &[&str] = &["text/plain", "image/png", "image/jpg"];
 
-struct SharedState {
+struct SharedStateInner {
     next_item_id: AtomicU64,
     items: Mutex<Vec<HistoryItem>>,
-    notify_write_send: PipeWriter,
 
     data_control_manager: OnceLock<ExtDataControlManagerV1>,
     data_control_devices: Mutex<HashMap</*seat global name */ u32, ExtDataControlDeviceV1>>,
-    qh: QueueHandle<WlState>,
+    qh: QueueHandle<SharedState>,
+}
+
+struct SharedState {
+    inner: Arc<SharedStateInner>,
+    /// wl_seat that arrived before the data control manager so we weren't able to grab their device immediatly.
+    deferred_seats: Vec<WlSeat>,
+}
+
+impl Deref for SharedState {
+    type Target = SharedStateInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 struct InProgressOffer {
@@ -58,14 +70,7 @@ struct InProgressOffer {
     time: Duration,
 }
 
-struct WlState {
-    shared_state: Arc<SharedState>,
-
-    /// wl_seat that arrived before the data control manager so we weren't able to grab their device immediatly.
-    deferred_seats: Vec<WlSeat>,
-}
-
-impl Dispatch<WlRegistry, ()> for WlState {
+impl Dispatch<WlRegistry, ()> for SharedState {
     fn event(
         state: &mut Self,
         proxy: &WlRegistry,
@@ -84,14 +89,13 @@ impl Dispatch<WlRegistry, ()> for WlState {
                     info!("A new seat was connected");
                     let seat: WlSeat = proxy.bind(name, 1, qhandle, ());
 
-                    match state.shared_state.data_control_manager.get() {
+                    match state.data_control_manager.get() {
                         None => {
                             state.deferred_seats.push(seat);
                         }
                         Some(manager) => {
                             let device = manager.get_data_device(&seat, qhandle, ());
                             state
-                                .shared_state
                                 .data_control_devices
                                 .lock()
                                 .unwrap()
@@ -104,7 +108,7 @@ impl Dispatch<WlRegistry, ()> for WlState {
                     for seat in state.deferred_seats.drain(..) {
                         let device = manager.get_data_device(&seat, qhandle, ());
                         state
-                            .shared_state
+                            .inner
                             .data_control_devices
                             .lock()
                             .unwrap()
@@ -112,7 +116,6 @@ impl Dispatch<WlRegistry, ()> for WlState {
                     }
 
                     state
-                        .shared_state
                         .data_control_manager
                         .set(manager)
                         .expect("ext_data_control_manager_v1 already set, global appeared twice?");
@@ -120,18 +123,13 @@ impl Dispatch<WlRegistry, ()> for WlState {
             }
             wayland_client::protocol::wl_registry::Event::GlobalRemove { name } => {
                 // try to remove, if it's not a wl_seat it may not exist
-                state
-                    .shared_state
-                    .data_control_devices
-                    .lock()
-                    .unwrap()
-                    .remove(&name);
+                state.data_control_devices.lock().unwrap().remove(&name);
             }
             _ => {}
         }
     }
 }
-impl Dispatch<ExtDataControlManagerV1, ()> for WlState {
+impl Dispatch<ExtDataControlManagerV1, ()> for SharedState {
     fn event(
         _state: &mut Self,
         _proxy: &ExtDataControlManagerV1,
@@ -143,7 +141,7 @@ impl Dispatch<ExtDataControlManagerV1, ()> for WlState {
         // no events at the time of writing
     }
 }
-impl Dispatch<WlSeat, ()> for WlState {
+impl Dispatch<WlSeat, ()> for SharedState {
     fn event(
         _state: &mut Self,
         _proxy: &WlSeat,
@@ -155,7 +153,7 @@ impl Dispatch<WlSeat, ()> for WlState {
         // we don't care about anything about the seat
     }
 }
-impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
+impl Dispatch<ExtDataControlDeviceV1, ()> for SharedState {
     fn event(
         state: &mut Self,
         _proxy: &ExtDataControlDeviceV1,
@@ -191,7 +189,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
                     };
                     drop(mime_types);
 
-                    let history_state = state.shared_state.clone();
+                    let history_state = state.inner.clone();
                     let time = offer_data.time;
 
                     let (reader, writer) = std::io::pipe().unwrap();
@@ -240,7 +238,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
         }
     }
 
-    event_created_child!(WlState, ExtDataControlDeviceV1, [
+    event_created_child!(SharedState, ExtDataControlDeviceV1, [
         EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, InProgressOffer {
             mime_types: Default::default(),
             time: SystemTime::now()
@@ -250,7 +248,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WlState {
     ]);
 }
 
-impl Dispatch<ExtDataControlOfferV1, InProgressOffer> for WlState {
+impl Dispatch<ExtDataControlOfferV1, InProgressOffer> for SharedState {
     fn event(
         _state: &mut Self,
         _proxy: &ExtDataControlOfferV1,
@@ -268,7 +266,7 @@ impl Dispatch<ExtDataControlOfferV1, InProgressOffer> for WlState {
     }
 }
 
-impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
+impl Dispatch<ExtDataControlSourceV1, OfferData> for SharedState {
     fn event(
         _state: &mut Self,
         proxy: &ExtDataControlSourceV1,
@@ -302,15 +300,9 @@ impl Dispatch<ExtDataControlSourceV1, OfferData> for WlState {
     }
 }
 
-impl SharedState {
-    fn notify_wayland_request(&self) {
-        let _ = (&self.notify_write_send).write_all(&[0]);
-    }
-}
-
 fn do_copy_into_clipboard(
     entry: HistoryItem,
-    shared_state: &SharedState,
+    shared_state: &SharedStateInner,
 ) -> Result<(), eyre::Error> {
     for device in &*shared_state.data_control_devices.lock().unwrap() {
         let data_source = shared_state
@@ -341,34 +333,8 @@ fn do_copy_into_clipboard(
     Ok(())
 }
 
-fn dispatch_wayland(
-    mut queue: EventQueue<WlState>,
-    mut wl_state: WlState,
-    notify_write_recv: PipeReader,
-) -> eyre::Result<()> {
-    loop {
-        queue
-            .dispatch_pending(&mut wl_state)
-            .wrap_err("dispatching Wayland events")?;
-
-        let read_guard = queue
-            .prepare_read()
-            .wrap_err("preparing read from Wayland socket")?;
-        let _ = queue.flush();
-
-        let pollfd1_read = PollFd::from_borrowed_fd(read_guard.connection_fd(), PollFlags::IN);
-        let pollfd_signal = PollFd::from_borrowed_fd(notify_write_recv.as_fd(), PollFlags::IN);
-
-        let _ = rustix::event::poll(&mut [pollfd1_read, pollfd_signal], None);
-
-        read_guard
-            .read_without_dispatch()
-            .wrap_err("reading from wayland socket")?;
-    }
-}
-
 #[tracing::instrument(skip(peer, shared_state))]
-fn handle_peer(mut peer: UnixStream, shared_state: &SharedState) -> eyre::Result<()> {
+fn handle_peer(mut peer: UnixStream, shared_state: &SharedStateInner) -> eyre::Result<()> {
     let mut request = [0; 1];
     let Ok(()) = peer.read_exact(&mut request) else {
         return Ok(());
@@ -396,7 +362,7 @@ struct OfferData(Arc<[u8]>);
 
 fn handle_copy_message(
     mut peer: UnixStream,
-    shared_state: &SharedState,
+    shared_state: &SharedStateInner,
 ) -> Result<(), eyre::Error> {
     let mut id = [0; 8];
     peer.read_exact(&mut id).wrap_err("failed to read id")?;
@@ -412,25 +378,21 @@ fn handle_copy_message(
 
     do_copy_into_clipboard(item, &shared_state).wrap_err("doing copy")?;
 
-    shared_state.notify_wayland_request();
-
     Ok(())
 }
 
-fn handle_clear_message(shared_state: &SharedState) -> eyre::Result<()> {
+fn handle_clear_message(shared_state: &SharedStateInner) -> eyre::Result<()> {
     shared_state.items.lock().unwrap().clear();
 
     for device in &*shared_state.data_control_devices.lock().unwrap() {
         device.1.set_selection(None);
     }
 
-    shared_state.notify_wayland_request();
-
     Ok(())
 }
 
 fn read_fd_into_history(
-    history_state: &SharedState,
+    history_state: &SharedStateInner,
     time: std::time::Duration,
     mime: String,
     data_reader: impl Read,
@@ -514,35 +476,27 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
     let conn =
         wayland_client::Connection::connect_to_env().wrap_err("connecting to the compositor")?;
 
-    let mut queue = conn.new_event_queue::<WlState>();
+    let mut queue = conn.new_event_queue::<SharedState>();
 
-    let (notify_write_recv, notify_write_send) = std::io::pipe().expect("todo");
+    let mut shared_state = SharedState {
+        inner: Arc::new(SharedStateInner {
+            next_item_id: AtomicU64::new(0),
+            items: Mutex::new(Vec::<HistoryItem>::new()),
 
-    let shared_state = Arc::new(SharedState {
-        next_item_id: AtomicU64::new(0),
-        items: Mutex::new(Vec::<HistoryItem>::new()),
-        notify_write_send,
-
-        data_control_manager: OnceLock::new(),
-        data_control_devices: Mutex::new(HashMap::new()),
-        qh: queue.handle(),
-    });
-
-    let history_state2 = shared_state.clone();
-
-    let mut wl_state = WlState {
+            data_control_manager: OnceLock::new(),
+            data_control_devices: Mutex::new(HashMap::new()),
+            qh: queue.handle(),
+        }),
         deferred_seats: Vec::new(),
-
-        shared_state: history_state2,
     };
 
     conn.display().get_registry(&queue.handle(), ());
 
     queue
-        .roundtrip(&mut wl_state)
+        .roundtrip(&mut shared_state)
         .wrap_err("failed to set up wayland state")?;
 
-    if wl_state.shared_state.data_control_manager.get().is_none() {
+    if shared_state.data_control_manager.get().is_none() {
         bail!(
             "{} not found, the ext-data-control-v1 Wayland extension is likely unsupported by your compositor.\n\
             check https://wayland.app/protocols/ext-data-control-v1#compositor-support\
@@ -551,35 +505,53 @@ pub fn main_inner(socket_path: &PathBuf) -> eyre::Result<Infallible> {
         );
     }
 
-    rustix::fs::fcntl_setfl(notify_write_recv.as_fd(), OFlags::NONBLOCK).expect("todo");
-    rustix::fs::fcntl_setfl(conn.as_fd(), OFlags::NONBLOCK).expect("TODO");
+    let mut event_loop =
+        EventLoop::<SharedState>::try_new().wrap_err("failed to initialize event_loop")?;
 
-    let socket_path_clone = socket_path.to_owned();
-    std::thread::spawn(move || {
-        if let Err(err) = dispatch_wayland(queue, wl_state, notify_write_recv) {
-            error!("error on Wayland thread: {err:?}");
-            cleanup(&socket_path_clone);
-            std::process::exit(1);
-        }
-    });
+    WaylandSource::new(conn.clone(), queue)
+        .insert(event_loop.handle())
+        .unwrap();
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(socket, Interest::READ, Mode::Level),
+            |_, socket, shared_state| {
+                let peer = socket.accept();
+                match peer {
+                    Ok((peer, _)) => {
+                        let history_state = shared_state.inner.clone();
+                        std::thread::spawn(move || {
+                            let result = handle_peer(peer, &history_state);
+                            if let Err(err) = result {
+                                warn!("Error handling peer: {err:?}");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        warn!("Error accepting peer: {err}");
+                    }
+                }
+
+                Ok(calloop::PostAction::Continue)
+            },
+        )
+        .wrap_err("failed to register socket event source")?;
 
     info!("Listening on {}", socket_path.display());
 
-    for peer in socket.incoming() {
-        match peer {
-            Ok(peer) => {
-                let history_state = shared_state.clone();
-                std::thread::spawn(move || {
-                    let result = handle_peer(peer, &history_state);
-                    if let Err(err) = result {
-                        warn!("Error handling peer: {err:?}");
-                    }
-                });
-            }
-            Err(err) => {
-                warn!("Error accepting peer: {err}");
-            }
-        }
+    let socket_path_clone = socket_path.clone();
+
+    let result = event_loop.run(
+        std::time::Duration::from_millis(100),
+        &mut shared_state,
+        |_| {},
+    );
+
+    if let Err(err) = result {
+        error!("error on Wayland thread: {err:?}");
+        cleanup(&socket_path_clone);
+        std::process::exit(1);
     }
 
     unreachable!("socket.incoming will never return None")
